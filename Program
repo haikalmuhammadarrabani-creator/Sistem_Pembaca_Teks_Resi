@@ -1,0 +1,267 @@
+
+import os
+import sys
+import site
+
+# Pendaftaran folder DLL pyzbar otomatis untuk Windows
+possible_paths = site.getsitepackages() + [os.path.join(sys.prefix, 'Lib', 'site-packages')]
+for path in possible_paths:
+    pyzbar_dir = os.path.join(path, 'pyzbar')
+    if os.path.exists(pyzbar_dir):
+        if hasattr(os, 'add_dll_directory'):
+            try:
+                os.add_dll_directory(pyzbar_dir)
+            except Exception:
+                pass
+        os.environ['PATH'] = pyzbar_dir + os.path.pathsep + os.environ.get('PATH', '')
+
+import re
+import ctypes
+import tkinter as tk
+from tkinter import filedialog
+import cv2
+import numpy as np
+import easyocr
+import pandas as pd
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+
+reader = easyocr.Reader(['en', 'id'], gpu=True)
+
+# DAFTAR KATA BLACKLIST & LOGO NOISE
+BLACKLIST_WORDS = [
+    'j&t', 'express', 'ez', 'jnt', 'jet', 'exprez', 'exspress',
+    '8066', '1888', '(021)', '021', '80561888', 'lzo', 'izo', '9908', 'sshdxj', 'ssjddxa',
+    'pengirim', 'promo', 'tissue', 'murah', 'malang', 'jumlah', '1pcs', 'barang', 
+    'jolly', 'cod', 'order id', 'estimated', 'date', 'product name', 'sku', 
+    'seller', 'qty', 'tokopedia', 'shop', 'tiktok', 'syarat', 'ketentuan', 
+    'website', 'www.jet.co.id', 'in transit', 'total'
+]
+
+def remove_red_elements(image):
+    """Menghapus logo J&T terbalik dan stempel COD berwarna merah secara total"""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lower_red1 = np.array([0, 40, 40])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 40, 40])
+    upper_red2 = np.array([180, 255, 255])
+    
+    mask = cv2.inRange(hsv, lower_red1, upper_red1) | cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    result = image.copy()
+    result[mask > 0] = [255, 255, 255]
+    return result
+
+def adaptive_preprocess(frame):
+    # 1. Musnahkan elemen warna merah terlebih dahulu
+    no_red = remove_red_elements(frame)
+    
+    # 2. Resize 2x & Sharping
+    h, w = no_red.shape[:2]
+    resized = cv2.resize(no_red, (w * 2, h * 2), interpolation=cv2.INTER_LANCZOS4)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(gray, -1, kernel)
+    return sharpened
+
+def clean_routing_code(txt):
+    """Perbaikan spesifik untuk Kode Routing (misal: 560-BWSII-14A menjadi 560-BWS11-14A)"""
+    txt = re.sub(r'(\d{3}-[A-Z]+)[I|l]{2}(-\d+[A-Z0-9]+)', r'\111\2', txt, flags=re.IGNORECASE)
+    return txt
+
+def clean_address_text(txt):
+    """Pembersihan typo OCR aman berbasis konteks dan normalisasi pattern alamat"""
+    # 1. Hapus sisa header kata Penerima yang ikut terbaca
+    txt = re.sub(r'^\s*(Pcncrima|Penerima|Pcncr)\s*"?\s*', '', txt, flags=re.IGNORECASE)
+
+    # 2. Ubah tanda baca pemisah yang menempel (, . _ /) menjadi spasi
+    txt = re.sub(r'[,.:;\-_]+', ' ', txt)
+
+    # 3. Hapus Nomor Telepon & Variasi Sensor
+    txt = re.sub(r'\(?\s*62\s*\)?[0-9\*\+\#\s\-\.\(\)\_\/]{5,}', ' ', txt)
+    txt = re.sub(r'\b08[0-9\*\+\#\s\-\.\(\)\_\/]{5,}', ' ', txt)
+    
+    # 4. Hapus Elemen Logo/Stempel J&T
+    txt = re.sub(r'\b(8066|1888|021|80561888|9908|990B|izo|Lzo|SSHdXJ|ssJddxa|Sekafeel|Sekafeer|express|exprez|ez|j&t|jnt|jet)\b', '', txt, flags=re.IGNORECASE)
+
+    # 5. KOREKSI WILAYAH BERBASIS KONTEKS
+    txt = re.sub(r'\b(JAIA|JAMA|JANA|JAWA)\s*(I+MUR|IMUR|/IMUR|TIMUR)\b', 'JAWA TIMUR', txt, flags=re.IGNORECASE)
+    txt = re.sub(r'\bBOND[A-Z0-9]*[YOW0-9]+S[O0]\b', 'BONDOWOSO', txt, flags=re.IGNORECASE)
+    txt = re.sub(r'\b(I+MUR|T?IMUR|/IMUR)BONDOWOSO\b', 'TIMUR BONDOWOSO', txt, flags=re.IGNORECASE)
+    txt = re.sub(r'([A-Za-z]+)BONDOWOSO', r'\1 BONDOWOSO', txt, flags=re.IGNORECASE)
+    txt = re.sub(r'\b(TEGAL|EGAL)\s*(AMIEL|AMI\'EL|AMEL|AMPEL)\b', 'TEGAL AMPEL', txt, flags=re.IGNORECASE)
+
+    # 6. KOREKSI PATTERN ALAMAT (Blok, Angka, RT/RW)
+    # - Koreksi Blok (misal: Al0 -> A10)
+    txt = re.sub(r'\b([A-Za-z])([I|l])(0|\d+)\b', r'\1 1\3', txt)
+    
+    # - Normalisasi format RT/RW yang rusak akibat OCR
+    txt = re.sub(r'\bR[I1]\s*I?S?I?R?W?\b', 'RT/RW', txt, flags=re.IGNORECASE)
+    txt = re.sub(r'\bRT\s*[\.\,\_]?\s*(\d+)\s*[\/\-\_]?\s*RW\s*[\.\,\_]?\s*(\d+)\b', r'RT.\1/RW.\2', txt, flags=re.IGNORECASE)
+
+    # 7. Bersihkan Simbol Noise Sisa & Spasi Ganda
+    txt = re.sub(r'[\/\[\]\(\)\_\*\+\#"]+', ' ', txt)
+    txt = re.sub(r'\s+', ' ', txt).strip()
+    return txt
+
+def load_image_file():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAwareness()
+        except Exception:
+            pass
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    file_path = filedialog.askopenfilename(
+        title="Pilih File Gambar Resi",
+        filetypes=[("File Gambar", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff")])
+    root.destroy()
+    if not file_path:
+        file_path = input("\n[?] Masukkan path manual (atau Enter untuk keluar): ").strip('"\\: ')
+    if not file_path or not os.path.exists(file_path):
+        return None, None
+    return cv2.imread(file_path), os.path.basename(file_path)
+
+# Process Utama
+captured_frame, file_name = load_image_file()
+if captured_frame is not None:
+    ocr_input = adaptive_preprocess(captured_frame)
+    img_h, img_w = ocr_input.shape[:2]
+    
+    print("[Sistem] Memindai gambar untuk mengekstrak Kode Routing dan Alamat Penerima...")
+    ocr_results = reader.readtext(ocr_input)
+    
+    extracted_items = []
+    for bbox, text, prob in ocr_results:
+        if prob >= 0.15:
+            tl = (int(bbox[0][0]), int(bbox[0][1]))
+            br = (int(bbox[2][0]), int(bbox[2][1]))
+            x_center = (tl[0] + br[0]) / 2
+            
+            # FITUR BATAS SUMBU X: 5% HINGGA 80% LEBAR GAMBAR
+            if x_center < (img_w * 0.05) or x_center > (img_w * 0.80):
+                continue
+
+            extracted_items.append({
+                'text': text.strip(),
+                'prob': prob,
+                'bbox': (tl, br),
+                'y_min': tl[1],
+                'y_max': br[1],
+                'x_min': tl[0],
+                'x_max': br[0],
+                'y_center': (tl[1] + br[1]) / 2
+            })
+
+    # 1. KODE ROUTING
+    kode_routing = None
+    routing_pattern = re.compile(r'\b\d{3}-[A-Z0-9]{3,}-[A-Z0-9]+\b', re.IGNORECASE)
+    for item in extracted_items:
+        if routing_pattern.search(item['text']):
+            item['text'] = clean_routing_code(item['text'])
+            kode_routing = item
+            break
+
+    # 2. ALAMAT PENERIMA
+    penerima_y = 0
+    for item in extracted_items:
+        if 'penerima' in item['text'].lower():
+            penerima_y = item['y_min'] - 5
+            break
+
+    if penerima_y <= 0:
+        penerima_y = img_h * 0.15
+
+    stop_candidates = []
+    date_pattern = re.compile(r'\d{2}[-/\.]\d{2}[-/\.]\d{4}')
+
+    for item in extracted_items:
+        txt_l = item['text'].lower()
+        if item['y_min'] > penerima_y:
+            if any(k in txt_l for k in ['weight', 'ship', 'jumlah', '1pcs', 'barang', 'kg', 'cod']) or date_pattern.search(txt_l):
+                stop_candidates.append(item['y_min'])
+
+    stop_y = min(stop_candidates) if stop_candidates else (img_h * 0.50)
+
+    # C. Saring Baris Alamat
+    alamat_lines = []
+    for item in extracted_items:
+        txt = item['text']
+        txt_lower = txt.lower()
+
+        if penerima_y <= item['y_center'] <= stop_y:
+            if any(black in txt_lower for black in BLACKLIST_WORDS):
+                continue
+            if 'penerima' in txt_lower and len(txt_lower) < 12:
+                continue
+            if re.search(r'\b(ship|weight|kg)\b', txt_lower):
+                continue
+
+            if re.search(r'^\s*\(?\s*62\s*\)?[0-9\*\+\#\s\-\.\(\)\_\/]{5,}\s*$', txt) or re.search(r'^\s*08[0-9\*\+\#\s\-\.\(\)\_\/]{5,}\s*$', txt):
+                continue
+
+            cleaned_txt = clean_address_text(txt)
+
+            if len(cleaned_txt) > 1:
+                item['cleaned_text'] = cleaned_txt
+                alamat_lines.append(item)
+
+    # Urutkan posisi dari atas ke bawah, lalu kiri ke kanan
+    alamat_lines.sort(key=lambda k: (k['y_min'], k['x_min']))
+
+    # FORMAT HASIL EKSTRAKSI
+    res_kode_routing = kode_routing['text'] if kode_routing else "Tidak Ditemukan"
+    res_alamat_lengkap = " ".join([item['cleaned_text'] for item in alamat_lines]) if alamat_lines else "Tidak Ditemukan"
+    res_alamat_lengkap = re.sub(r'\s+', ' ', res_alamat_lengkap).strip()
+
+    # TAMPILKAN DI TERMINAL
+    print("\n================ HASIL EKSTRAKSI ================")
+    print(f"Nama File                 : {file_name}")
+    print(f"1. DATA ANGKA (ROUTING)   : {res_kode_routing}")
+    print(f"2. TABEL ALAMAT PENERIMA  : {res_alamat_lengkap}")
+    print("=================================================\n")
+
+    # ================= OUTPUT EKSPOR KE EXCEL =================
+    excel_output_path = 'hasil_ekstraksi_resi.xlsx'
+
+    data_baru = {
+        'Nama File Gambar:': [file_name],
+        'Kode Routing (Data Angka):': [res_kode_routing],
+        'Alamat Lengkap Penerima:': [res_alamat_lengkap]
+    }
+    df_baru = pd.DataFrame(data_baru)
+
+    if os.path.exists(excel_output_path):
+        try:
+            df_lama = pd.read_excel(excel_output_path)
+            df_total = pd.concat([df_lama, df_baru], ignore_index=True)
+        except PermissionError:
+            print("\n[ERROR] File Excel sedang terbuka! Harap TUTUP file 'hasil_ekstraksi_resi.xlsx' di Excel lalu jalankan ulang.")
+            sys.exit()
+    else:
+        df_total = df_baru
+
+    try:
+        with pd.ExcelWriter(excel_output_path, engine='openpyxl') as writer:
+            df_total.to_excel(writer, index=False, sheet_name='Data Resi')
+            worksheet = writer.sheets['Data Resi']
+            
+            bold_font = Font(bold=True)
+            for cell in worksheet[1]:
+                cell.font = bold_font
+
+            for col in worksheet.columns:
+                max_len = max(len(str(cell.value or '')) for cell in col)
+                col_letter = get_column_letter(col[0].column)
+                worksheet.column_dimensions[col_letter].width = max(max_len + 5, 15)
+
+        print(f"[Sukses] Data berhasil ditambahkan ke dalam file Excel: {excel_output_path}")
+    except PermissionError:
+        print("\n[ERROR] File Excel sedang terbuka! Harap TUTUP file 'hasil_ekstraksi_resi.xlsx' di Excel lalu coba lagi.")
+
+else:
+    print("[Sistem] Proses dibatalkan atau gambar tidak ditemukan.")
